@@ -1,0 +1,144 @@
+name: Review Tenhou Logs (mjai-reviewer + akochan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_pages:
+        description: "Publish reports to GitHub Pages?"
+        type: boolean
+        default: false
+  schedule:
+    # 毎週月曜 00:30 JST（= 日曜 15:30 UTC）
+    - cron: "30 15 * * 0"
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    outputs:
+      new_reports: ${{ steps.batch.outputs.new_reports }}
+
+    env:
+      OMP_NUM_THREADS: 8
+      REPORT_ROOT: reports
+      LIST_FILE: logs/list.txt
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libboost-all-dev cmake pkg-config curl git python3 python3-pip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/cargo-target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache akochan build
+        uses: actions/cache@v3
+        with:
+          path: .cache/akochan
+          key: ${{ runner.os }}-akochan-${{ hashFiles('scripts/akochan.version') }}
+          restore-keys: |
+            ${{ runner.os }}-akochan-
+
+      - name: Build mjai-reviewer
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/cargo-target
+        run: |
+          git clone --depth 1 https://github.com/Equim-chan/mjai-reviewer.git
+          cd mjai-reviewer
+          cargo build --release
+          echo "${CARGO_TARGET_DIR}/release" >> $GITHUB_PATH
+
+      - name: Build akochan engine
+        run: |
+          set -euo pipefail
+          AKOCHAN_CACHE_DIR="${GITHUB_WORKSPACE}/.cache/akochan"
+          mkdir -p "${AKOCHAN_CACHE_DIR}"
+          rm -rf akochan
+          if [[ -d "${AKOCHAN_CACHE_DIR}/.git" ]]; then
+            mkdir -p akochan
+            shopt -s dotglob
+            cp -a "${AKOCHAN_CACHE_DIR}/." akochan/
+            shopt -u dotglob
+            git -C akochan fetch origin
+            git -C akochan reset --hard origin/master
+          else
+            git clone --depth 1 https://github.com/critter-mj/akochan.git akochan
+          fi
+          cd akochan/ai_src
+          make -f Makefile_Linux
+          cd ..
+          make -f Makefile_Linux
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf "${AKOCHAN_CACHE_DIR}"
+          mkdir -p "${AKOCHAN_CACHE_DIR}"
+          shopt -s dotglob
+          cp -a akochan/. "${AKOCHAN_CACHE_DIR}/"
+          shopt -u dotglob
+          echo "LD_LIBRARY_PATH=$(pwd)/akochan" >> $GITHUB_ENV
+
+      - name: Prepare Python scripts
+        run: |
+          pip3 install beautifulsoup4 lxml jinja2
+
+      - name: Prepare report dirs
+        run: |
+          mkdir -p "${REPORT_ROOT}"
+          echo "MONTH_DIR=${REPORT_ROOT}/$(date +%Y%m)" >> $GITHUB_ENV
+          mkdir -p "${REPORT_ROOT}/$(date +%Y%m)"
+
+      - name: Run batch review
+        id: batch
+        run: |
+          bash scripts/run_review_batch.sh "${LIST_FILE}" "${MONTH_DIR}"
+
+      - name: Aggregate mistake trends
+        if: steps.batch.outputs.new_reports == 'true'
+        run: |
+          python3 scripts/aggregate_trends.py --in "${MONTH_DIR}" --out "${MONTH_DIR}/summary.json"
+
+      - name: Build index.html
+        if: steps.batch.outputs.new_reports == 'true'
+        run: |
+          python3 scripts/build_index.py --root "${REPORT_ROOT}"
+
+      - name: Upload artifact
+        if: steps.batch.outputs.new_reports == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mjai-reports
+          path: reports
+
+      - name: Upload pages artifact (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages && steps.batch.outputs.new_reports == 'true' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: reports
+
+  deploy-pages:
+    needs: review
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages && needs.review.outputs.new_reports == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
