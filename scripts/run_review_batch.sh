@@ -4,6 +4,8 @@ LIST_FILE="${1:-logs/list.txt}"
 OUT_DIR="${2:-reports/$(date +%Y%m)}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 processed=0
+skipped_existing=0
+total_candidates=0
 
 if [[ ! -f "$LIST_FILE" ]]; then
   echo "Not found: $LIST_FILE" >&2
@@ -24,6 +26,7 @@ while IFS= read -r url; do
   if [[ "$url" =~ log=([^&]+) ]]; then
     gid="${BASH_REMATCH[1]}"
   fi
+  total_candidates=$((total_candidates+1))
 
   target_dir="${OUT_DIR}/${gid}"
   target_index="${target_dir}/index.html"
@@ -32,6 +35,7 @@ while IFS= read -r url; do
   if [[ "$SKIP_EXISTING" == "1" && -s "$target_index" ]]; then
     echo "[mjai-reviewer] skip existing report -> ${target_index}"
     idx=$((idx+1))
+    skipped_existing=$((skipped_existing+1))
     continue
   fi
 
@@ -44,12 +48,15 @@ while IFS= read -r url; do
   idx=$((idx+1))
 done < "$LIST_FILE"
 
+if (( processed == 0 )); then
+  echo "[mjai-reviewer] no new reports generated (candidates=${total_candidates}, skipped=${skipped_existing})"
+else
+  echo "[mjai-reviewer] generated ${processed} report(s) (skipped=${skipped_existing})"
+fi
+
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  if (( processed > 0 )); then
-    echo "new_reports=true" >> "$GITHUB_OUTPUT"
-    echo "processed_count=${processed}" >> "$GITHUB_OUTPUT"
-  else
-    echo "new_reports=false" >> "$GITHUB_OUTPUT"
-    echo "processed_count=0" >> "$GITHUB_OUTPUT"
-  fi
+  echo "new_reports=$([[ $processed -gt 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+  echo "processed_count=${processed}" >> "$GITHUB_OUTPUT"
+  echo "skipped_existing=${skipped_existing}" >> "$GITHUB_OUTPUT"
+  echo "total_candidates=${total_candidates}" >> "$GITHUB_OUTPUT"
 fi

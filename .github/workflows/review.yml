@@ -20,6 +20,7 @@ jobs:
       id-token: write
     outputs:
       new_reports: ${{ steps.batch.outputs.new_reports }}
+      processed_count: ${{ steps.batch.outputs.processed_count }}
 
     env:
       OMP_NUM_THREADS: 8
@@ -45,7 +46,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             .cache/cargo-target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('scripts/mjai-reviewer.version') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -61,7 +62,18 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/cargo-target
         run: |
-          git clone --depth 1 https://github.com/Equim-chan/mjai-reviewer.git
+          set -euo pipefail
+          MJAI_REF=$(grep -E '^ref=' scripts/mjai-reviewer.version | head -n 1 | cut -d= -f2- | tr -d '[:space:]')
+          CLONE_URL="https://github.com/Equim-chan/mjai-reviewer.git"
+          if [[ -n "$MJAI_REF" ]]; then
+            if ! git clone --depth 1 --branch "$MJAI_REF" "$CLONE_URL"; then
+              echo "Requested ref '$MJAI_REF' not found; falling back to default branch" >&2
+              rm -rf mjai-reviewer
+              git clone --depth 1 "$CLONE_URL"
+            fi
+          else
+            git clone --depth 1 "$CLONE_URL"
+          fi
           cd mjai-reviewer
           cargo build --release
           echo "${CARGO_TARGET_DIR}/release" >> $GITHUB_PATH
@@ -70,6 +82,10 @@ jobs:
         run: |
           set -euo pipefail
           AKOCHAN_CACHE_DIR="${GITHUB_WORKSPACE}/.cache/akochan"
+          AKOCHAN_REF=$(grep -E '^ref=' scripts/akochan.version | head -n 1 | cut -d= -f2- | tr -d '[:space:]')
+          if [[ -z "$AKOCHAN_REF" ]]; then
+            AKOCHAN_REF="master"
+          fi
           mkdir -p "${AKOCHAN_CACHE_DIR}"
           rm -rf akochan
           if [[ -d "${AKOCHAN_CACHE_DIR}/.git" ]]; then
@@ -78,9 +94,18 @@ jobs:
             cp -a "${AKOCHAN_CACHE_DIR}/." akochan/
             shopt -u dotglob
             git -C akochan fetch origin
-            git -C akochan reset --hard origin/master
+            if git -C akochan rev-parse --verify "origin/${AKOCHAN_REF}" >/dev/null 2>&1; then
+              git -C akochan checkout "${AKOCHAN_REF}" || git -C akochan checkout -B "${AKOCHAN_REF}" "origin/${AKOCHAN_REF}"
+              git -C akochan reset --hard "origin/${AKOCHAN_REF}"
+            else
+              echo "Requested ref '$AKOCHAN_REF' not found; staying on default cache branch" >&2
+            fi
           else
-            git clone --depth 1 https://github.com/critter-mj/akochan.git akochan
+            if ! git clone --depth 1 --branch "${AKOCHAN_REF}" https://github.com/critter-mj/akochan.git akochan; then
+              echo "Requested ref '$AKOCHAN_REF' not found; falling back to default branch" >&2
+              rm -rf akochan
+              git clone --depth 1 https://github.com/critter-mj/akochan.git akochan
+            fi
           fi
           cd akochan/ai_src
           make -f Makefile_Linux
@@ -98,43 +123,57 @@ jobs:
         run: |
           pip3 install beautifulsoup4 lxml jinja2
 
+      - name: Determine report month
+        id: report_ctx
+        run: |
+          set -euo pipefail
+          MONTH=$(date +%Y%m)
+          echo "month=${MONTH}" >> "$GITHUB_OUTPUT"
+          echo "MONTH_DIR=${REPORT_ROOT}/${MONTH}" >> "$GITHUB_ENV"
+
+      - name: Restore report cache
+        uses: actions/cache@v3
+        with:
+          path: reports
+          key: ${{ runner.os }}-reports-${{ steps.report_ctx.outputs.month }}-${{ hashFiles('logs/list.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-reports-${{ steps.report_ctx.outputs.month }}-
+
       - name: Prepare report dirs
         run: |
           mkdir -p "${REPORT_ROOT}"
-          echo "MONTH_DIR=${REPORT_ROOT}/$(date +%Y%m)" >> $GITHUB_ENV
-          mkdir -p "${REPORT_ROOT}/$(date +%Y%m)"
+          mkdir -p "${MONTH_DIR}"
 
       - name: Run batch review
         id: batch
         run: |
           bash scripts/run_review_batch.sh "${LIST_FILE}" "${MONTH_DIR}"
+        env:
+          SKIP_EXISTING: 1
 
       - name: Aggregate mistake trends
-        if: steps.batch.outputs.new_reports == 'true'
         run: |
           python3 scripts/aggregate_trends.py --in "${MONTH_DIR}" --out "${MONTH_DIR}/summary.json"
 
       - name: Build index.html
-        if: steps.batch.outputs.new_reports == 'true'
         run: |
           python3 scripts/build_index.py --root "${REPORT_ROOT}"
 
       - name: Upload artifact
-        if: steps.batch.outputs.new_reports == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: mjai-reports
           path: reports
 
       - name: Upload pages artifact (optional)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages && steps.batch.outputs.new_reports == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: reports
 
   deploy-pages:
     needs: review
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages && needs.review.outputs.new_reports == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages }}
     runs-on: ubuntu-latest
     permissions:
       pages: write
